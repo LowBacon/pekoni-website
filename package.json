@@ -1,0 +1,43 @@
+{
+  "name": "pekoni",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pekoni — cinematic Minecraft-inspired community and gaming platform featuring MineBet minigames, progression, cases, leaderboards and virtual Pekoni Coins.",
+  "scripts": {
+    "predev": "node scripts/check-env.mjs",
+    "dev": "next dev",
+    "build": "prisma generate && next build",
+    "build:static": "node scripts/build-static.mjs",
+    "prestart": "node scripts/check-env.mjs --production",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:studio": "prisma studio",
+    "db:seed": "tsx --env-file-if-exists=.env prisma/seed.ts",
+    "setup": "prisma generate && prisma db push && npm run db:seed"
+  },
+  "prisma": {
+    "seed": "tsx --env-file-if-exists=.env prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.1.0",
+    "next": "15.1.6",
+    "oauth4webapi": "^3.8.7",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.0.0",
+    "@types/node": "^22.10.5",
+    "@types/react": "^19.0.7",
+    "@types/react-dom": "^19.0.3",
+    "postcss": "^8.5.1",
+    "prisma": "^6.1.0",
+    "tailwindcss": "^4.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

@@ -1,0 +1,653 @@
+// Pekoni — data model
+//
+// The default provider is SQLite so the project runs with zero configuration.
+// The schema deliberately avoids provider-specific features (native enums, Json
+// columns) so switching to PostgreSQL is a one-line change:
+//
+//   provider = "postgresql"
+//
+// followed by `npm run db:migrate`. Enum-like columns are stored as String and
+// are constrained in TypeScript (see src/lib/enums.ts).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String  @id @default(cuid())
+  username      String  @unique
+  usernameLower String  @unique
+  email         String? @unique
+  // Null for accounts that only ever sign in through Google or Discord.
+  passwordHash  String?
+  role          String  @default("USER") // USER | MODERATOR | ADMIN | OWNER
+  status        String  @default("ACTIVE") // ACTIVE | SUSPENDED
+
+  minecraftUsername String?
+  minecraftUuid     String?
+  /**
+   * Portrait from a linked provider; the Minecraft head still wins when set.
+   */
+  avatarUrl         String?
+
+  level Int @default(1)
+  xp    Int @default(0)
+
+  // Provably-fair seeds. serverSeed is never exposed until rotated.
+  serverSeed     String
+  serverSeedHash String
+  clientSeed     String
+  nonce          Int    @default(0)
+
+  /// Null until the player finishes onboarding (username, avatar, preferences).
+  onboardedAt DateTime?
+
+  soundEnabled   Boolean @default(false)
+  reducedMotion  Boolean @default(false)
+  publicActivity Boolean @default(true)
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  lastSeenAt DateTime @default(now())
+
+  wallet         Wallet?
+  sessions       Session[]
+  oauthAccounts  OAuthAccount[]
+  minecraft      MinecraftAccount?
+  linkCodes      MinecraftLinkCode[]
+  transfers      Transfer[]
+  limits         PlayLimits?
+  transactions   Transaction[]
+  gameRounds     GameRound[]
+  gameSessions   GameSession[]
+  caseOpenings   CaseOpening[]
+  battleEntries  BattleParticipant[]
+  dailyRewards   DailyReward[]
+  achievements   UserAchievement[]
+  notifications  Notification[]
+  activity       ActivityEvent[]
+  auditLogs      AdminAuditLog[]     @relation("AuditActor")
+  auditTargets   AdminAuditLog[]     @relation("AuditTarget")
+  battlesCreated CaseBattle[]        @relation("BattleCreator")
+  stats          UserStats?
+
+  @@index([role])
+  @@index([status])
+}
+
+/// A third-party identity bound to a Pekoni account.
+///
+/// One row per provider per user, so a player can hold both a Google and a
+/// Discord link and sign in with either. `providerAccountId` is the provider's
+/// own immutable id — never the e-mail, which users can change.
+model OAuthAccount {
+  id                String @id @default(cuid())
+  provider          String // GOOGLE | DISCORD
+  providerAccountId String
+  userId            String
+  user              User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Snapshot of the profile at link time. Display only — never authorisation.
+  email         String?
+  emailVerified Boolean @default(false)
+  displayName   String?
+  avatarUrl     String?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  lastLoginAt DateTime @default(now())
+
+  @@unique([provider, providerAccountId])
+  @@unique([userId, provider])
+  @@index([userId])
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  tokenHash  String   @unique
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userAgent  String?
+  /// Coarse location hint from the request, e.g. "Helsinki, FI". Never an IP.
+  ipHash     String?
+  createdAt  DateTime @default(now())
+  lastUsedAt DateTime @default(now())
+  expiresAt  DateTime
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Minecraft identity
+// ---------------------------------------------------------------------------
+
+/// A verified Minecraft account.
+///
+/// Keyed on the Mojang UUID, which never changes; the username is a cached
+/// display value that the plugin refreshes. One Minecraft account can back at
+/// most one Pekoni account, and vice versa — otherwise two websites accounts
+/// could drain coins into the same in-game player.
+model MinecraftAccount {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  uuid          String @unique
+  username      String
+  usernameLower String
+
+  verifiedAt DateTime  @default(now())
+  /// Last time the plugin reported this player online. Drives connection health.
+  lastSeenAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([usernameLower])
+}
+
+/// A short-lived, single-use code the player types in-game to prove ownership.
+///
+/// The code is the only thing that crosses the trust boundary, so it is short
+/// enough to type, long enough not to guess, expires in minutes, and is burned
+/// on first use.
+model MinecraftLinkCode {
+  code   String @id
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  expiresAt    DateTime
+  consumedAt   DateTime?
+  consumedUuid String?
+  attempts     Int       @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Transfers to the Minecraft server
+// ---------------------------------------------------------------------------
+
+/// One coin transfer from a Pekoni wallet into the game server.
+///
+/// The debit happens immediately and atomically when the transfer is created,
+/// so the coins cannot be spent twice while the transfer is in flight. Delivery
+/// is then a separate, retryable step: the plugin claims the transfer, credits
+/// the player in game, and reports back. A transfer that is never delivered is
+/// refunded through the ledger — the balance is never edited directly.
+model Transfer {
+  id        String @id @default(cuid())
+  /// Short, human-quotable receipt reference, e.g. "MB-7F3K-92QD".
+  reference String @unique
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Snapshot of the destination at request time — a later rename or unlink
+  /// must not change where a historical transfer says it went.
+  minecraftUuid String
+  minecraftName String
+
+  amount    Int
+  /// Only WEBSITE_TO_SERVER is supported. Stored so the receipt is explicit.
+  direction String @default("WEBSITE_TO_SERVER")
+  status    String @default("PENDING") // PENDING | CLAIMED | COMPLETED | FAILED
+
+  /// Ledger entries: the debit, and the refund if it had to be undone.
+  debitTxId  String?
+  refundTxId String?
+
+  failureReason String?
+  attempts      Int       @default(0)
+  claimedAt     DateTime?
+  completedAt   DateTime?
+  failedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@index([minecraftUuid])
+}
+
+// ---------------------------------------------------------------------------
+// Responsible play
+// ---------------------------------------------------------------------------
+
+/// Player-set guard rails. Only the player can loosen them, and loosening
+/// takes effect after a cooling-off period so it cannot be done mid-session.
+model PlayLimits {
+  userId String @id
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Maximum coins wagered per rolling 24 hours. Null = no limit.
+  dailyWagerCap Int?
+  /// Maximum single bet. Null = no limit.
+  maxBet        Int?
+  /// A self-imposed break. Games refuse to run until this passes.
+  breakUntil    DateTime?
+  /// A loosened limit does not apply until this moment.
+  pendingCap    Int?
+  pendingCapAt  DateTime?
+
+  updatedAt DateTime @updatedAt
+}
+
+// Denormalised counters. Every write goes through the same transaction that
+// writes the ledger entry, so these can never drift from the ledger.
+model UserStats {
+  userId String @id
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  gamesPlayed   Int      @default(0)
+  totalWagered  Int      @default(0)
+  totalWon      Int      @default(0)
+  biggestWin    Int      @default(0)
+  winStreak     Int      @default(0)
+  bestWinStreak Int      @default(0)
+  highestCrash  Float    @default(0)
+  bestMinesMult Float    @default(0)
+  casesOpened   Int      @default(0)
+  battlesPlayed Int      @default(0)
+  battlesWon    Int      @default(0)
+  mobsDefeated  Int      @default(0)
+  bestCombo     Int      @default(0)
+  updatedAt     DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Economy
+// ---------------------------------------------------------------------------
+
+model Wallet {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance   Int      @default(0)
+  version   Int      @default(0) // optimistic lock guard
+  updatedAt DateTime @updatedAt
+}
+
+model Transaction {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type          String // see src/lib/enums.ts TransactionType
+  amount        Int // signed: negative = debit
+  balanceBefore Int
+  balanceAfter  Int
+  source        String
+  gameId        String?
+  metadata      String? // JSON string
+  createdAt     DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([type])
+}
+
+// Guards against double-spend on retried/replayed requests.
+model IdempotencyKey {
+  key       String   @id
+  userId    String
+  scope     String
+  result    String? // JSON string of the original response
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Games
+// ---------------------------------------------------------------------------
+
+model GameRound {
+  liveResult LiveResult?
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  game       String // dice | crash | mines | slots | mobgrinder | lasthope
+  bet        Int
+  payout     Int
+  multiplier Float    @default(0)
+  outcome    String // WIN | LOSS | PUSH
+  serverSeed String
+  clientSeed String
+  nonce      Int
+  result     String // JSON string
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([game, createdAt])
+}
+
+// Multi-step games (mines, crash, last hope, mob grinder) keep authoritative
+// state server-side between requests. The client never learns the outcome early.
+model GameSession {
+  activeKey String? @unique
+  revision Int @default(0)
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  game       String
+  status     String    @default("ACTIVE") // ACTIVE | CASHED_OUT | BUSTED | EXPIRED
+  bet        Int
+  state      String // JSON string — server-only truth
+  serverSeed String
+  clientSeed String
+  nonce      Int
+  payout     Int       @default(0)
+  multiplier Float     @default(0)
+  startedAt  DateTime  @default(now())
+  endedAt    DateTime?
+  expiresAt  DateTime
+
+  @@index([userId, game, status])
+}
+
+/// Durable publication log: inserted in the SAME transaction as GameRound.
+/// Sequence is the stable SSE/history cursor; retained for replay and auditing.
+model LiveResult {
+  sequence Int @id @default(autoincrement())
+  roundId String @unique
+  /*
+    Cascades with the round it publishes.
+
+    Without this the relation defaults to Restrict, and because GameRound
+    cascades from User, a published result silently made the whole account
+    undeletable — the delete failed on a foreign key with no useful message.
+    A live result is a projection of its round, so it belongs to that round's
+    lifetime; the durable financial record is the Transaction ledger, which is
+    unaffected by this.
+  */
+  round GameRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  userId String
+  game String
+  wager Int
+  payout Int
+  net Int
+  outcome String
+  settledAt DateTime @default(now())
+  @@index([settledAt, sequence])
+  @@index([game, settledAt])
+  @@index([userId, settledAt])
+  @@index([net, settledAt])
+}
+
+model PluginNonce {
+  nonce String @id
+  expiresAt DateTime
+  @@index([expiresAt])
+}
+
+model GameConfig {
+  game String @id
+  enabled Boolean @default(true)
+  minBet Int @default(10)
+  maxBet Int @default(10000)
+  updatedAt DateTime @updatedAt
+}
+
+model PlatformState {
+  id String @id @default("platform")
+  maintenance Boolean @default(false)
+  notice String @default("")
+  pluginSeenAt DateTime?
+}
+
+model RetiredSeed {
+  hash String @id
+  seed String
+  userId String
+  retiredAt DateTime @default(now())
+  @@index([userId, retiredAt])
+}
+
+// ---------------------------------------------------------------------------
+// Cases
+// ---------------------------------------------------------------------------
+
+model Case {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  tagline     String
+  description String
+  price       Int
+  theme       String // drives the artwork variant
+  kind        String   @default("STANDARD") // STANDARD | DAILY
+  sortOrder   Int      @default(0)
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  items    CaseItem[]
+  openings CaseOpening[]
+  battles  CaseBattle[]
+}
+
+model CaseItem {
+  id        String   @id @default(cuid())
+  caseId    String
+  case      Case     @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  name      String
+  rarity    String // COMMON | UNCOMMON | RARE | EPIC | LEGENDARY | MYTHIC
+  icon      String // symbolic icon key, rendered as original vector art
+  value     Int // coin value
+  weight    Int // relative probability weight
+  createdAt DateTime @default(now())
+
+  openings     CaseOpening[]
+  battleRounds BattleRound[]
+
+  @@index([caseId])
+}
+
+model CaseOpening {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  caseId    String
+  case      Case     @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  itemId    String
+  item      CaseItem @relation(fields: [itemId], references: [id])
+  cost      Int
+  value     Int
+  source    String   @default("SHOP") // SHOP | DAILY | BATTLE
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([caseId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Case battles
+// ---------------------------------------------------------------------------
+
+model CaseBattle {
+  id         String    @id @default(cuid())
+  caseId     String
+  case       Case      @relation(fields: [caseId], references: [id])
+  creatorId  String
+  creator    User      @relation("BattleCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  mode       String // CLASSIC | TEAM | CRAZY
+  rounds     Int
+  slots      Int
+  entryCost  Int
+  prizePool  Int       @default(0)
+  status     String    @default("WAITING") // WAITING | RUNNING | FINISHED | CANCELLED
+  winnerId   String?
+  startsAt   DateTime?
+  createdAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  participants BattleParticipant[]
+  battleRounds BattleRound[]
+
+  @@index([status, createdAt])
+}
+
+model BattleParticipant {
+  id       String     @id @default(cuid())
+  battleId String
+  battle   CaseBattle @relation(fields: [battleId], references: [id], onDelete: Cascade)
+  userId   String?
+  user     User?      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  botName  String?
+  slot     Int
+  team     Int        @default(0)
+  total    Int        @default(0)
+  payout   Int        @default(0)
+  isWinner Boolean    @default(false)
+  joinedAt DateTime   @default(now())
+
+  rounds BattleRound[]
+
+  @@unique([battleId, slot])
+  @@index([userId])
+}
+
+model BattleRound {
+  id            String            @id @default(cuid())
+  battleId      String
+  battle        CaseBattle        @relation(fields: [battleId], references: [id], onDelete: Cascade)
+  participantId String
+  participant   BattleParticipant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+  roundNumber   Int
+  itemId        String
+  item          CaseItem          @relation(fields: [itemId], references: [id])
+  value         Int
+
+  @@index([battleId, roundNumber])
+}
+
+// ---------------------------------------------------------------------------
+// Rewards & progression
+// ---------------------------------------------------------------------------
+
+model DailyReward {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount    Int
+  streak    Int      @default(1)
+  itemName  String?
+  rarity    String?
+  claimedAt DateTime @default(now())
+
+  @@index([userId, claimedAt])
+}
+
+model Achievement {
+  id          String @id @default(cuid())
+  slug        String @unique
+  title       String
+  description String
+  icon        String
+  category    String @default("GENERAL")
+  target      Int    @default(1)
+  xpReward    Int    @default(0)
+  coinReward  Int    @default(0)
+  sortOrder   Int    @default(0)
+
+  unlocks UserAchievement[]
+}
+
+model UserAchievement {
+  id            String      @id @default(cuid())
+  userId        String
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  achievementId String
+  achievement   Achievement @relation(fields: [achievementId], references: [id], onDelete: Cascade)
+  progress      Int         @default(0)
+  unlockedAt    DateTime?
+
+  @@unique([userId, achievementId])
+  @@index([userId])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      String // INFO | SUCCESS | WARNING | REWARD | ACHIEVEMENT
+  title     String
+  body      String?
+  href      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+}
+
+// Public, sanitised feed. Never references a transaction or balance.
+model ActivityEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      String // GAME_WIN | CASE_OPEN | BATTLE_WIN | LEVEL_UP | ACHIEVEMENT
+  label     String
+  amount    Int?
+  rarity    String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Operations
+// ---------------------------------------------------------------------------
+
+/// Who did what, when, and what it replaced.
+///
+/// The log deliberately outlives the accounts it names. Cascading it on user
+/// delete would mean an administrator could erase the record of their own
+/// actions by closing their account, which is the one thing an audit trail
+/// exists to prevent — so the links null out instead, and the usernames are
+/// denormalised at write time so a row stays readable once the account is gone.
+model AdminAuditLog {
+  id         String   @id @default(cuid())
+
+  actorId    String?
+  actor      User?    @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  /// Snapshot of the actor's name. Survives deletion of the account.
+  actorName  String   @default("(deleted)")
+
+  targetId   String?
+  target     User?    @relation("AuditTarget", fields: [targetId], references: [id], onDelete: SetNull)
+  targetName String?
+
+  action     String
+  summary    String
+  metadata   String?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorId])
+}
+
+model ServerStatusCache {
+  id            String   @id @default(cuid())
+  host          String   @unique
+  edition       String // JAVA | BEDROCK
+  online        Boolean  @default(false)
+  playersOnline Int?
+  playersMax    Int?
+  version       String?
+  motd          String?
+  lastError     String?
+  fetchedAt     DateTime @default(now())
+}

@@ -1,0 +1,43 @@
+import fs from 'node:fs';
+const edit = (p, fn) => fs.writeFileSync(p, fn(fs.readFileSync(p, 'utf8')));
+edit('src/server/limits.ts', s => s.replace('import { prisma }', 'import { prisma, type Tx }').replace('wageredLast24h(userId: string)', 'wageredLast24h(userId: string, db: Tx = prisma)').replace('getLimits(userId: string)', 'getLimits(userId: string, db: Tx = prisma)').replace('assertCanWager(userId: string, bet: number)', 'assertCanWager(userId: string, bet: number, db: Tx = prisma)').replaceAll('prisma.transaction.aggregate','db.transaction.aggregate').replaceAll('prisma.playLimits.findUnique','db.playLimits.findUnique').replaceAll('prisma.playLimits.update(', 'db.playLimits.update(').replace('await wageredLast24h(userId)', 'await wageredLast24h(userId, db)').replace('await getLimits(userId);', 'await getLimits(userId, db);').replace('row?.pendingCap !== null && row?.pendingCapAt', 'row?.pendingCapAt').replace('const existing = await db.playLimits.findUnique', 'const existing = await prisma.playLimits.findUnique'));
+edit('src/server/wallet.ts', s => s.replace('Math.trunc(Math.abs(entry.amount))', 'Math.abs(entry.amount)').replace('!Number.isFinite(amount) || amount < 0', '!Number.isSafeInteger(amount) || amount > 2_000_000_000').replace('  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);\n  await prisma.idempotencyKey.deleteMany({ where: { createdAt: { lt: cutoff } } });', '  // Financial replay keys are permanent. Expiry would allow old requests to debit again.'));
+edit('src/server/games/engine.ts', s => {
+ s = s.replace('import { assertCanWager }', 'import { publishSettlement } from "../results";\nimport { assertGameAvailable } from "../operations";\nimport { assertCanWager }');
+ s = s.replace('  await assertCanWager(userId, bet);', '');
+ s = s.replace('      await applyLedgerEntry(tx, userId, {', '      await assertCanWager(userId, bet, tx);\n      await assertGameAvailable(tx, game, bet);\n      await applyLedgerEntry(tx, userId, {');
+ // Only the debit gate is needed; payout must remain possible during maintenance.
+ s = s.replace('        await assertCanWager(userId, bet, tx);\n      await assertGameAvailable(tx, game, bet);\n      await applyLedgerEntry(tx, userId, {', '        await applyLedgerEntry(tx, userId, {');
+ s = s.replace('      const profit = payout - bet;', '      await publishSettlement(tx, round.id);\n      const profit = payout - bet;');
+ s = s.replace('  await assertCanWager(userId, bet);', '');
+ s = s.replace('  await applyLedgerEntry(tx, userId, {\n    type: "GAME_BET",', '  await assertCanWager(userId, bet, tx);\n  await assertGameAvailable(tx, game, bet);\n  await applyLedgerEntry(tx, userId, {\n    type: "GAME_BET",');
+ s = s.replace('      state: JSON.stringify(input.state),', '      activeKey: `${userId}:${game}`,\n      state: JSON.stringify(input.state),');
+ s = s.replace('  if (payout > 0) {', '  const guard = await tx.gameSession.updateMany({ where: { id: input.sessionId, userId, status: "ACTIVE" }, data: { status: input.status, activeKey: null } });\n  if (guard.count !== 1) throw new Error("Peli on jo päättynyt.");\n\n  if (payout > 0) {');
+ // Above replacement also matches indented instant branch; remove there.
+ s = s.replace('    const guard = await tx.gameSession.updateMany({ where: { id: input.sessionId, userId, status: "ACTIVE" }, data: { status: input.status, activeKey: null } });\n  if (guard.count !== 1) throw new Error("Peli on jo päättynyt.");\n\n  if (payout > 0) {', '    if (payout > 0) {');
+ s = s.replace('  await tx.gameRound.create({', '  const settledRound = await tx.gameRound.create({');
+ s = s.replace('  const profit = payout - bet;', '  await publishSettlement(tx, settledRound.id);\n  const profit = payout - bet;');
+ s = s.replace('      await publishSettlement(tx, settledRound.id);\n  const profit', '      const profit');
+ s = s.replace('  const session = await tx.gameSession.findUnique({ where: { id: sessionId } });', '  await tx.gameSession.updateMany({ where: { id: sessionId, userId, game, status: "ACTIVE" }, data: { revision: { increment: 1 } } });\n  const session = await tx.gameSession.findUnique({ where: { id: sessionId } });');
+ const start = s.indexOf('  if (session.expiresAt < new Date())');
+ if(start>=0) s = s.slice(0,start) + '  // Interrupted choice games remain recoverable. Their stake stays reserved until settlement.\n' + s.slice(s.indexOf('  return session;',start));
+ return s;
+});
+edit('src/server/progression.ts', s => { const a=s.indexOf('  const user =',s.indexOf('export async function pushActivity')); const b=s.indexOf('\n}\n',a); return s.slice(0,a)+'  // Legacy publication disabled; historical ActivityEvent rows remain untouched.\n  void tx; void userId; void input;'+s.slice(b); });
+edit('src/server/queries.ts', s => { const a=s.indexOf('  const events =',s.indexOf('export async function getActivityFeed')); const b=s.indexOf('\n}\n',a); s=s.slice(0,a)+'  void limit;\n  return [];'+s.slice(b); return s.replaceAll('status: "ACTIVE" }', 'status: "ACTIVE", publicActivity: true }').replace('.sort((a, b) => b.value - a.value)', '.filter(row => row.value > 0).sort((a, b) => b.value - a.value)'); });
+edit('src/app/api/activity/route.ts', () => 'import { NextResponse } from "next/server";\nexport function GET() { return NextResponse.json({ feed: [], retired: true, replacement: "/api/results" }, { status: 410 }); }\n');
+for(const p of ['mines','crash','mobgrinder','lasthope']) edit(`src/app/api/games/${p}/route.ts`,s=>s.replaceAll(', expiresAt: { gt: new Date() }',''));
+edit('src/server/admin.ts',s=>s.replace('  return prisma.$transaction(async (tx) => {', '  if (!reason) throw new AdminError("Anna muutokselle perustelu.");\n  return prisma.$transaction(async (tx) => {').replace('const metadata: Record<string, unknown> = { reason: reason || null, actorRole };','const metadata: Record<string, unknown> = { reason, actorRole, previous: { role: target.role, status: target.status } };'));
+edit('src/server/pluginAuth.ts',s=>s.replace('import crypto from "node:crypto";', 'import crypto from "node:crypto";\nimport { prisma } from "./db";').replace('  if (!rememberNonce(nonce, now)) {\n    throw new PluginAuthError("Pyyntö on jo käsitelty.", 409);\n  }', '  try {\n    await prisma.pluginNonce.create({ data: { nonce, expiresAt: new Date(now + CLOCK_SKEW_MS * 2) } });\n  } catch { throw new PluginAuthError("Pyyntö on jo käsitelty.", 409); }\n  await prisma.pluginNonce.deleteMany({ where: { expiresAt: { lt: new Date(now) } } });'));
+edit('src/server/minecraft.ts',s=>{
+ s=s.replace('import { prisma }', 'import { prisma, type Tx }').replace('getTransferLimits(userId: string)', 'getTransferLimits(userId: string, db: Tx = prisma)').replace('const used = await prisma.transfer.aggregate','const used = await db.transfer.aggregate');
+ const a=s.indexOf('  const limits = await getTransferLimits(input.userId);'); const b=s.indexOf('  return prisma.$transaction',a); s=s.slice(0,a)+s.slice(b);
+ const at=s.indexOf('    const ledger =',s.indexOf('export async function createTransfer'));
+ s=s.slice(0,at)+'    await tx.user.update({ where: { id: input.userId }, data: { updatedAt: new Date() } });\n    const limits = await getTransferLimits(input.userId, tx);\n    if (amount > limits.remainingToday) throw new MinecraftError("Vuorokauden siirtoraja on täynnä.", "DAILY_CAP", 429);\n'+s.slice(at);
+ s=s.replace('  reason: string,\n)', '  reason: string,\n  confirmedNotDelivered = false,\n)');
+ s=s.replace('    // Conditional, so a completion', '    if (transfer.status === "CLAIMED" && !confirmedNotDelivered) throw new MinecraftError("Delivery is uncertain; reconciliation is required.", "DELIVERY_UNCERTAIN", 409);\n\n    // Conditional, so a completion');
+ const r=s.indexOf('export async function reapStaleTransfers'); const re=s.indexOf('/** Records',r); s=s.slice(0,r)+'export async function reapStaleTransfers(): Promise<number> {\n  // A timeout is not proof of non-delivery. Never refund uncertain transfers.\n  return 0;\n}\n\n'+s.slice(re);
+ s=s.replace('  if (uuids.length === 0) return 0;', '  await prisma.platformState.upsert({ where: { id: "platform" }, create: { id: "platform", pluginSeenAt: new Date() }, update: { pluginSeenAt: new Date() } });\n  if (uuids.length === 0) return 0;');
+ return s;
+});
+edit('src/app/api/plugin/transfers/fail/route.ts',s=>s.replace('reason?: string }','reason?: string; confirmedNotDelivered?: boolean }').replace('String(body.reason ?? "Palvelin ilmoitti virheestä."))','String(body.reason ?? "Palvelin ilmoitti virheestä."), body.confirmedNotDelivered === true)'));
