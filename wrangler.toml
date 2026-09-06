@@ -1,0 +1,29 @@
+# Cloudflare Workers deployment for the static export.
+#
+# This publishes `npm run build:static` — the build with no server. Accounts,
+# balances and game results live in each visitor's browser (src/lib/static),
+# so it is a playable demo, not the real product. The full app needs a Node
+# runtime and a database; see README.
+#
+# Cloudflare's build settings take two commands, and they do different jobs:
+#
+#   Build command:   npx prisma generate && npm run build:static
+#   Deploy command:  npx wrangler deploy
+#
+# The build has to run `prisma generate` first: the server modules are still
+# type-checked while `src/app/api` is parked aside, so the generated client
+# must exist even though nothing queries a database in this build.
+#
+# `name` must match the Worker in the dashboard, or the deploy creates a
+# second one alongside it.
+
+name = "pekoni-website"
+compatibility_date = "2024-12-01"
+
+[assets]
+directory = "./out"
+
+# Deep links are client-routed: /games/dice is a real directory here, but an
+# unknown path should still reach the app rather than a bare error. The static
+# build writes 404.html as a copy of the app shell for exactly this.
+not_found_handling = "404-page"
