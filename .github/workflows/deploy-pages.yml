@@ -42,6 +42,11 @@ jobs:
       - name: Configure Pages
         id: pages
         uses: actions/configure-pages@v5
+        with:
+          # Creates the Pages site on the first run instead of failing, so a
+          # fresh fork deploys without anyone visiting the settings page. It is
+          # a no-op once the site exists.
+          enablement: true
 
       - name: Build static export
         env:
